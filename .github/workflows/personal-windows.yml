@@ -1,0 +1,145 @@
+---
+# Builds the personal Windows fork on every push to `personal` and publishes a GitHub
+# release, plus the update manifest Moonlight checks, when run manually with `release` checked.
+name: Personal Windows
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - personal
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Publish a GitHub release
+        type: boolean
+        default: false
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+env:
+  QT_VERSION: 6.12.0
+
+jobs:
+  build:
+    runs-on: windows-2025
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+        with:
+          submodules: 'recursive'
+          fetch-depth: 1
+
+      - name: Set version
+        id: version
+        shell: bash
+        run: |
+          # Upstream's major.minor.patch plus this workflow's run number, so every release sorts newer.
+          base="$(cut -d. -f1-3 app/version.txt)"
+          version="${base}.${GITHUB_RUN_NUMBER}"
+          printf '%s' "${version}" > app/version.txt
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "CI_VERSION=${version}" >> "${GITHUB_ENV}"
+
+      - name: Download dependencies
+        run: powershell ./setup-deps.ps1
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          cache: true
+          set-env: false
+          add-tools-to-path: false
+          tools: 'tools_qtcreator_gui'
+          version: ${{ env.QT_VERSION }}
+          aqtsource: 'git+https://github.com/miurahr/aqtinstall.git@073e34d7c2ab4ae6961ed7cca690b3abd5ba5a7e'
+
+      - name: Install Qt ARM64
+        uses: jurplel/install-qt-action@v4
+        with:
+          cache: true
+          set-env: false
+          add-tools-to-path: false
+          arch: win64_msvc2022_arm64_cross_compiled
+          version: ${{ env.QT_VERSION }}
+
+      - name: Build x64 binaries
+        shell: cmd
+        run: |
+          set "PATH=%QT_PATH%;%PATH%"
+          scripts\build-arch.bat Release x64
+        env:
+          QT_PATH: ${{ runner.workspace }}\Qt\${{ env.QT_VERSION }}\msvc2022_64\bin
+
+      - name: Build ARM64 binaries
+        shell: cmd
+        run: |
+          set "PATH=%QT_PATH%;%PATH%"
+          scripts\build-arch.bat Release arm64
+        env:
+          QT_PATH: ${{ runner.workspace }}\Qt\${{ env.QT_VERSION }}\msvc2022_arm64\bin
+
+      - name: Build installer bundle
+        shell: cmd
+        run: scripts\generate-bundle.bat Release
+
+      - name: Collect release files
+        shell: bash
+        run: |
+          mkdir -p release
+          cp build/installer-Release/MoonlightSetup-*.exe release/
+          cp build/installer-x64-Release/MoonlightPortable-*.zip release/
+          cp build/installer-arm64-Release/MoonlightPortable-*.zip release/
+
+      - name: Upload release files
+        uses: actions/upload-artifact@v6
+        with:
+          name: Moonlight-Windows-${{ steps.version.outputs.version }}
+          path: release/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release files
+        uses: actions/download-artifact@v7
+        with:
+          name: Moonlight-Windows-${{ needs.build.outputs.version }}
+          path: release
+
+      - name: Write update manifest
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          cd release
+          sha256sum ./* > SHA256SUMS.txt
+          installer="MoonlightSetup-${VERSION}.exe"
+          sha="$(sha256sum "${installer}" | cut -d' ' -f1)"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases"
+          jq -n --arg v "${VERSION}" --arg page "${base}/tag/v${VERSION}" \
+                --arg url "${base}/download/v${VERSION}/${installer}" --arg sha "${sha}" '
+            [ "x86_64", "arm64" ] | map({
+              platform: "windows", arch: ., version: $v,
+              browser_url: $page, installer_url: $url, installer_sha256: $sha
+            })' > qt.json
+          cat qt.json
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          gh release create "v${VERSION}" release/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "Moonlight ${VERSION}" \
+            --generate-notes
