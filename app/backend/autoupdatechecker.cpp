@@ -200,6 +200,7 @@ void AutoUpdateChecker::handleUpdateCheckRequestFinished(QNetworkReply* reply)
                         m_BrowserUrl = updateObj["browser_url"].toString();
                         m_InstallerUrl = updateObj["installer_url"].toString();
                         m_InstallerSha256 = QByteArray::fromHex(updateObj["installer_sha256"].toString().toLatin1());
+                        emit canInstallUpdateChanged();
                         emit onUpdateAvailable(m_NewVersion, m_BrowserUrl);
                         return;
                     }

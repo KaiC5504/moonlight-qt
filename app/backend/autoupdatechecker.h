@@ -14,12 +14,13 @@ public:
     // Downloads the installer named in the update manifest, checks its hash, runs it and quits
     Q_INVOKABLE bool installUpdate();
 
-    Q_PROPERTY(bool canInstallUpdate READ canInstallUpdate NOTIFY onUpdateAvailable)
+    Q_PROPERTY(bool canInstallUpdate READ canInstallUpdate NOTIFY canInstallUpdateChanged)
     bool canInstallUpdate() const;
 
 signals:
     void onUpdateAvailable(QString newVersion, QString url);
     void updateInstallFailed(QString url);
+    void canInstallUpdateChanged();
 
 private slots:
     void handleUpdateCheckRequestFinished(QNetworkReply* reply);
