@@ -2,6 +2,7 @@
 #include "settings/streamingpreferences.h"
 #include "streaming/streamutils.h"
 #include "backend/richpresencemanager.h"
+#include "streaming/clipboardsync.h"
 
 #include <Limelight.h>
 #include "SDL_compat.h"
@@ -576,6 +577,7 @@ Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *prefere
       m_QtWindow(nullptr),
       m_UnexpectedTermination(true), // Failure prior to streaming is unexpected
       m_InputHandler(nullptr),
+      m_ClipboardSync(nullptr),
       m_MouseEmulationRefCount(0),
       m_FlushingWindowEventsRef(0),
       m_ShouldExit(false),
@@ -1967,6 +1969,11 @@ void Session::exec()
     // Start rich presence to indicate we're in game
     RichPresenceManager presence(*m_Preferences, m_App.name);
 
+    {
+        NvHTTP http(m_Computer);
+        m_ClipboardSync = new ClipboardSync(http.m_BaseUrlHttps, http.serverCert());
+    }
+
     // Toggle the stats overlay if requested by the user
     m_OverlayManager.setOverlayState(Overlay::OverlayDebug, m_Preferences->showPerformanceOverlay);
 
@@ -2321,6 +2328,9 @@ void Session::exec()
     }
 
 DispatchDeferredCleanup:
+    delete m_ClipboardSync;
+    m_ClipboardSync = nullptr;
+
     // Switch back to synchronous logging mode
     StreamUtils::exitAsyncLoggingMode();
 

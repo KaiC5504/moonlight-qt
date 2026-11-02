@@ -364,20 +364,37 @@ ApplicationWindow {
                 visible: false
 
                 onClicked: {
-                    if (SystemProperties.hasBrowser) {
+                    if (AutoUpdateChecker.canInstallUpdate) {
+                        enabled = false
+                        ToolTip.text = qsTr("Downloading update...")
+                        AutoUpdateChecker.installUpdate()
+                    }
+                    else if (SystemProperties.hasBrowser) {
                         Qt.openUrlExternally(browserUrl);
                     }
                 }
 
                 function updateAvailable(version, url)
                 {
-                    ToolTip.text = qsTr("Update available for Moonlight: Version %1").arg(version)
+                    ToolTip.text = AutoUpdateChecker.canInstallUpdate ?
+                                qsTr("Click to install Moonlight %1").arg(version) :
+                                qsTr("Update available for Moonlight: Version %1").arg(version)
                     updateButton.browserUrl = url
                     updateButton.visible = true
                 }
 
+                function updateInstallFailed(url)
+                {
+                    enabled = true
+                    ToolTip.text = qsTr("Update failed. Click to open the download page.")
+                    if (SystemProperties.hasBrowser) {
+                        Qt.openUrlExternally(url);
+                    }
+                }
+
                 Component.onCompleted: {
                     AutoUpdateChecker.onUpdateAvailable.connect(updateAvailable)
+                    AutoUpdateChecker.updateInstallFailed.connect(updateInstallFailed)
                     AutoUpdateChecker.start()
                 }
 

@@ -160,6 +160,27 @@ CenteredGridView {
             elide: Text.ElideRight
         }
 
+        Label {
+            id: inUseBadge
+            visible: model.online && model.activeSessions !== ""
+            text: qsTr("In use by %1").arg(model.activeSessions)
+
+            anchors.top: parent.top
+            anchors.topMargin: 6
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: Math.min(implicitWidth, parent.width - 12)
+            padding: 6
+            font.pointSize: 13
+            font.bold: true
+            color: "white"
+            elide: Text.ElideRight
+            horizontalAlignment: Text.AlignHCenter
+            background: Rectangle {
+                color: "#c62828"
+                radius: 6
+            }
+        }
+
         Loader {
             id: pcContextMenuLoader
             asynchronous: true
@@ -170,6 +191,12 @@ CenteredGridView {
                     text: qsTr("PC Status: %1").arg(model.online ? qsTr("Online") : qsTr("Offline"))
                     font.bold: true
                     enabled: false
+                }
+                MenuItem {
+                    text: qsTr("In use by %1").arg(model.activeSessions)
+                    enabled: false
+                    visible: model.online && model.activeSessions !== ""
+                    height: visible ? implicitHeight : 0
                 }
                 NavigableMenuItem {
                     text: qsTr("View All Apps")

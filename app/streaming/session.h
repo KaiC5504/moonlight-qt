@@ -11,6 +11,8 @@
 #include "audio/renderers/renderer.h"
 #include "video/overlaymanager.h"
 
+class ClipboardSync;
+
 class SupportedVideoFormatList : public QList<int>
 {
 public:
@@ -260,6 +262,7 @@ private:
     QQuickWindow* m_QtWindow;
     bool m_UnexpectedTermination;
     SdlInputHandler* m_InputHandler;
+    ClipboardSync* m_ClipboardSync;
     int m_MouseEmulationRefCount;
     int m_FlushingWindowEventsRef;
     QStringList m_LaunchWarnings;

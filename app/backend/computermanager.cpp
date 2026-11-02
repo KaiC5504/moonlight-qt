@@ -20,10 +20,13 @@ class PcMonitorThread : public QThread
 
 #define TRIES_BEFORE_OFFLINING 2
 #define POLLS_PER_APPLIST_FETCH 10
+#define POLLS_PER_DENIED_SESSIONS_FETCH 20
 
 public:
     PcMonitorThread(NvComputer* computer)
-        : m_Computer(computer)
+        : m_Computer(computer),
+          m_SessionsSupported(true),
+          m_PollsUntilSessionsFetch(0)
     {
         setObjectName("Polling thread for " + computer->name);
     }
@@ -70,6 +73,38 @@ private:
         QWriteLocker lock(&m_Computer->lock);
         changed = m_Computer->updateAppList(appList);
         return true;
+    }
+
+    void updateActiveSessions(QNetworkAccessManager* nam, bool& changed)
+    {
+        if (!m_SessionsSupported || --m_PollsUntilSessionsFetch > 0) {
+            return;
+        }
+
+        NvHTTP http(m_Computer, nam);
+
+        QStringList names;
+        try {
+            names = http.getOtherActiveSessions();
+        } catch (const QtNetworkReplyException& e) {
+            if (e.getError() == QNetworkReply::ContentAccessDenied) {
+                // The host may grant this later, so check again now and then
+                m_PollsUntilSessionsFetch = POLLS_PER_DENIED_SESSIONS_FETCH;
+            }
+            else if (e.getError() == QNetworkReply::ContentNotFoundError) {
+                // Official Sunshine and GFE never will
+                m_SessionsSupported = false;
+            }
+            names.clear();
+        } catch (...) {
+            return;
+        }
+
+        QWriteLocker lock(&m_Computer->lock);
+        if (m_Computer->activeSessionNames != names) {
+            m_Computer->activeSessionNames = names;
+            changed = true;
+        }
     }
 
     void run() override
@@ -137,6 +172,16 @@ private:
                 }
             }
 
+            if (m_Computer->state == NvComputer::CS_ONLINE &&
+                    m_Computer->pairState == NvComputer::PS_PAIRED) {
+                updateActiveSessions(&nam, stateChanged);
+            }
+            else if (!m_Computer->activeSessionNames.isEmpty()) {
+                QWriteLocker lock(&m_Computer->lock);
+                m_Computer->activeSessionNames.clear();
+                stateChanged = true;
+            }
+
             if (stateChanged) {
                 // Tell anyone listening that we've changed state
                 emit computerStateChanged(m_Computer);
@@ -156,6 +201,8 @@ signals:
 
 private:
     NvComputer* m_Computer;
+    bool m_SessionsSupported;
+    int m_PollsUntilSessionsFetch;
 };
 
 ComputerManager::ComputerManager(StreamingPreferences* prefs)

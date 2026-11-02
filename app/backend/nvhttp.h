@@ -175,6 +175,10 @@ public:
     QVector<NvApp>
     getAppList();
 
+    // Names of the other paired devices streaming from a Sunshine host that lets us see them
+    QStringList
+    getOtherActiveSessions();
+
     QImage
     getBoxArt(int appId);
 

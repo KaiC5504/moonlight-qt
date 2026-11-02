@@ -4,6 +4,12 @@
 #include <QJsonDocument>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QCoreApplication>
+#include <QCryptographicHash>
+#include <QDir>
+#include <QFile>
+#include <QProcess>
+#include <QStandardPaths>
 
 AutoUpdateChecker::AutoUpdateChecker(QObject *parent) :
     QObject(parent)
@@ -44,7 +50,8 @@ void AutoUpdateChecker::start()
 #endif
 
     // We'll get a callback when this is finished
-    QUrl url("https://moonlight-stream.org/updates/qt.json");
+    // Personal fork: releases and their update manifest live on GitHub
+    QUrl url("https://github.com/KaiC5504/moonlight-qt/releases/latest/download/qt.json");
     QNetworkRequest request(url);
 #if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
     request.setAttribute(QNetworkRequest::Http2AllowedAttribute, true);
@@ -189,8 +196,11 @@ void AutoUpdateChecker::handleUpdateCheckRequestFinished(QNetworkReply* reply)
                     if (res < 0) {
                         // m_CurrentVersionQuad < latestVersionQuad
                         qDebug() << "Update available";
-                        emit onUpdateAvailable(updateObj["version"].toString(),
-                                               updateObj["browser_url"].toString());
+                        m_NewVersion = updateObj["version"].toString();
+                        m_BrowserUrl = updateObj["browser_url"].toString();
+                        m_InstallerUrl = updateObj["installer_url"].toString();
+                        m_InstallerSha256 = QByteArray::fromHex(updateObj["installer_sha256"].toString().toLatin1());
+                        emit onUpdateAvailable(m_NewVersion, m_BrowserUrl);
                         return;
                     }
                     else if (res > 0) {
@@ -215,4 +225,72 @@ void AutoUpdateChecker::handleUpdateCheckRequestFinished(QNetworkReply* reply)
         qWarning() << "Update checking failed with error:" << reply->error();
         reply->deleteLater();
     }
+}
+
+bool AutoUpdateChecker::canInstallUpdate() const
+{
+#ifdef Q_OS_WIN32
+    return QUrl(m_InstallerUrl).scheme() == "https" && m_InstallerSha256.size() == 32;
+#else
+    return false;
+#endif
+}
+
+bool AutoUpdateChecker::installUpdate()
+{
+    if (!canInstallUpdate()) {
+        return false;
+    }
+
+    qInfo() << "Downloading Moonlight" << m_NewVersion << "from" << m_InstallerUrl;
+
+    auto nam = new QNetworkAccessManager(this);
+    nam->setStrictTransportSecurityEnabled(true);
+    nam->setRedirectPolicy(QNetworkRequest::NoLessSafeRedirectPolicy);
+    connect(nam, &QNetworkAccessManager::finished,
+            this, &AutoUpdateChecker::handleInstallerDownloadFinished);
+
+    QNetworkRequest request{QUrl(m_InstallerUrl)};
+    request.setTransferTimeout(5 * 60 * 1000);
+    nam->get(request);
+    return true;
+}
+
+void AutoUpdateChecker::handleInstallerDownloadFinished(QNetworkReply* reply)
+{
+    reply->deleteLater();
+    reply->manager()->deleteLater();
+
+    if (reply->error() != QNetworkReply::NoError) {
+        qWarning() << "Update download failed:" << reply->error();
+        emit updateInstallFailed(m_BrowserUrl);
+        return;
+    }
+
+    QByteArray installer = reply->readAll();
+    if (QCryptographicHash::hash(installer, QCryptographicHash::Sha256) != m_InstallerSha256) {
+        qWarning() << "Downloaded installer does not match the update manifest hash";
+        emit updateInstallFailed(m_BrowserUrl);
+        return;
+    }
+
+    // Saved by us rather than a browser, so the file carries no Mark of the Web and SmartScreen stays quiet
+    QString path = QDir(QStandardPaths::writableLocation(QStandardPaths::TempLocation))
+                       .filePath(QString("MoonlightSetup-%1.exe").arg(m_NewVersion));
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) || file.write(installer) != installer.size()) {
+        qWarning() << "Unable to save installer to" << path;
+        emit updateInstallFailed(m_BrowserUrl);
+        return;
+    }
+    file.close();
+
+    if (!QProcess::startDetached(path, {})) {
+        qWarning() << "Unable to start installer" << path;
+        emit updateInstallFailed(m_BrowserUrl);
+        return;
+    }
+
+    // The installer replaces files this process has open
+    QCoreApplication::quit();
 }

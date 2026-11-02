@@ -11,6 +11,9 @@
 #include <QImageReader>
 #include <QtEndian>
 #include <QNetworkProxy>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 
 #define FAST_FAIL_TIMEOUT_MS 2000
 #define REQUEST_TIMEOUT_MS 5000
@@ -430,6 +433,31 @@ NvHTTP::getXmlString(QString xml,
     }
 
     return QString();
+}
+
+QStringList
+NvHTTP::getOtherActiveSessions()
+{
+    QString response = openConnectionToString(m_BaseUrlHttps,
+                                              "actions/sessions",
+                                              nullptr,
+                                              REQUEST_TIMEOUT_MS,
+                                              NvLogLevel::NVLL_NONE);
+
+    QJsonDocument document = QJsonDocument::fromJson(response.toUtf8());
+    if (!document.isObject() || !document.object().value("sessions").isArray()) {
+        throw QtNetworkReplyException(QNetworkReply::ContentNotFoundError, "Host does not report active sessions");
+    }
+
+    QStringList names;
+    const QJsonArray sessions = document.object().value("sessions").toArray();
+    for (const QJsonValue& session : sessions) {
+        QJsonObject entry = session.toObject();
+        if (!entry.value("self").toBool()) {
+            names.append(entry.value("name").toString());
+        }
+    }
+    return names;
 }
 
 void NvHTTP::handleSslErrors(QNetworkReply* reply, const QList<QSslError>& errors)
