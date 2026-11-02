@@ -93,6 +93,8 @@ jobs:
         run: |
           mkdir -p release
           cp build/installer-Release/MoonlightSetup-*.exe release/
+          # A fixed name lets releases/latest/download/MoonlightSetup.exe always fetch the newest installer
+          cp build/installer-Release/MoonlightSetup-*.exe release/MoonlightSetup.exe
           cp build/installer-x64-Release/MoonlightPortable-*.zip release/
           cp build/installer-arm64-Release/MoonlightPortable-*.zip release/
 
