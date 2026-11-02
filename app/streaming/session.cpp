@@ -1974,6 +1974,10 @@ void Session::exec()
         m_ClipboardSync = new ClipboardSync(http.m_BaseUrlHttps, http.serverCert());
     }
 
+    // Files dropped onto the stream window are copied to the host
+    SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
+    QStringList droppedFiles;
+
     // Toggle the stats overlay if requested by the user
     m_OverlayManager.setOverlayState(Overlay::OverlayDebug, m_Preferences->showPerformanceOverlay);
 
@@ -2020,6 +2024,18 @@ void Session::exec()
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "Quit event received");
             goto DispatchDeferredCleanup;
+
+        case SDL_DROPFILE:
+            droppedFiles.append(QString::fromUtf8(event.drop.file));
+            SDL_free(event.drop.file);
+            break;
+
+        case SDL_DROPCOMPLETE:
+            if (!droppedFiles.isEmpty()) {
+                m_ClipboardSync->sendFiles(droppedFiles);
+                droppedFiles.clear();
+            }
+            break;
 
         case SDL_USEREVENT:
             switch (event.user.code) {

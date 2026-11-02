@@ -3,25 +3,35 @@
 
 #include <QBuffer>
 #include <QCryptographicHash>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QImage>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QStandardPaths>
 #include <QThread>
 #include <QTimer>
+#include <QUrlQuery>
 #include <QtDebug>
 
 #include <string>
 
 #ifdef Q_OS_WIN32
 #include <windows.h>
+#include <shlobj.h>
 #endif
 
 #define TICK_INTERVAL_MS 250
 #define TICKS_PER_POLL 2
 #define MAX_ITEM_SIZE (32 * 1024 * 1024)
+#define MAX_TRANSFER_SIZE (512LL * 1024 * 1024)
 #define TEXT_MIME "text/plain;charset=utf-8"
 #define PNG_MIME "image/png"
+#define FILES_MIME "application/x-moonlight-files+json"
 #define SEQUENCE_HEADER "X-Clipboard-Seq"
 
 static QByteArray hashItem(const ClipboardItem& item)
@@ -33,15 +43,47 @@ static QByteArray hashItem(const ClipboardItem& item)
     return hash.result();
 }
 
+static int httpStatus(QNetworkReply* reply)
+{
+    return reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+}
+
+// Downloads land in a Moonlight folder under Downloads, never overwriting earlier ones
+static QString downloadPath(QString name)
+{
+    name = QFileInfo(name).fileName();
+    static const QString reserved = QStringLiteral("<>:\"/\\|?*");
+    for (QChar& c : name) {
+        if (c.unicode() < 0x20 || reserved.contains(c)) {
+            c = '_';
+        }
+    }
+    if (name.isEmpty() || name == "." || name == "..") {
+        name = "file";
+    }
+
+    QDir dir(QStandardPaths::writableLocation(QStandardPaths::DownloadLocation));
+    dir.mkpath("Moonlight");
+    dir.cd("Moonlight");
+
+    QFileInfo info(name);
+    QString path = dir.filePath(name);
+    for (int copy = 2; QFileInfo::exists(path); copy++) {
+        QString suffix = info.suffix().isEmpty() ? QString() : "." + info.suffix();
+        path = dir.filePath(QString("%1 (%2)%3").arg(info.completeBaseName()).arg(copy).arg(suffix));
+    }
+    return path;
+}
+
 ClipboardSync::ClipboardSync(QUrl hostBaseUrl, QSslCertificate serverCert)
-    : m_Thread(new QThread())
+    : m_Thread(new QThread()),
+      m_Worker(new ClipboardSyncWorker(hostBaseUrl, serverCert))
 {
     m_Thread->setObjectName("Clipboard sync");
 
-    auto worker = new ClipboardSyncWorker(hostBaseUrl, serverCert);
-    worker->moveToThread(m_Thread);
-    connect(m_Thread, &QThread::started, worker, &ClipboardSyncWorker::start);
-    connect(m_Thread, &QThread::finished, worker, &QObject::deleteLater);
+    m_Worker->moveToThread(m_Thread);
+    connect(m_Thread, &QThread::started, m_Worker, &ClipboardSyncWorker::start);
+    connect(m_Thread, &QThread::finished, m_Worker, &QObject::deleteLater);
     m_Thread->start(QThread::LowPriority);
 }
 
@@ -50,6 +92,11 @@ ClipboardSync::~ClipboardSync()
     m_Thread->quit();
     m_Thread->wait();
     delete m_Thread;
+}
+
+void ClipboardSync::sendFiles(const QStringList& paths)
+{
+    QMetaObject::invokeMethod(m_Worker, "sendFiles", Qt::QueuedConnection, Q_ARG(QStringList, paths));
 }
 
 ClipboardSyncWorker::ClipboardSyncWorker(QUrl hostBaseUrl, QSslCertificate serverCert)
@@ -63,7 +110,10 @@ ClipboardSyncWorker::ClipboardSyncWorker(QUrl hostBaseUrl, QSslCertificate serve
       m_HaveRemoteSeq(false),
       m_LocalSeq(0),
       m_Ticks(0),
-      m_Window(nullptr)
+      m_Window(nullptr),
+      m_TransferReply(nullptr),
+      m_DownloadSeq(0),
+      m_PendingDownloadSeq(0)
 {
 }
 
@@ -126,7 +176,17 @@ void ClipboardSyncWorker::tick()
 
         ClipboardItem item = readLocal();
         if (!item.isNull() && item.data.size() <= MAX_ITEM_SIZE && hashItem(item) != m_LastHash) {
-            upload(item);
+            if (item.mimeType == FILES_MIME) {
+                m_LastHash = hashItem(item);
+                QStringList paths;
+                for (const QJsonValue& path : QJsonDocument::fromJson(item.data).array()) {
+                    paths.append(path.toString());
+                }
+                sendFiles(paths);
+            }
+            else {
+                upload(item);
+            }
         }
     }
 #endif
@@ -136,22 +196,16 @@ void ClipboardSyncWorker::tick()
     }
 }
 
-QNetworkReply* ClipboardSyncWorker::sendRequest(const QString& query, const ClipboardItem* body)
+QNetworkRequest ClipboardSyncWorker::makeRequest(const QString& path, const QString& query)
 {
     QUrl url(m_HostBaseUrl);
-    url.setPath("/actions/clipboard");
-    url.setQuery(query);
+    url.setPath(path);
+    url.setQuery(query, QUrl::StrictMode);
 
     QNetworkRequest request(url);
     request.setSslConfiguration(IdentityManager::get()->getSslConfig());
     request.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
-    request.setTransferTimeout(10000);
-
-    if (body != nullptr) {
-        request.setHeader(QNetworkRequest::ContentTypeHeader, body->mimeType);
-        return m_Nam->post(request, body->data);
-    }
-    return m_Nam->get(request);
+    return request;
 }
 
 void ClipboardSyncWorker::poll()
@@ -160,7 +214,10 @@ void ClipboardSyncWorker::poll()
         return;
     }
 
-    m_PollReply = sendRequest(m_HaveRemoteSeq ? QString("since=%1").arg(m_RemoteSeq) : QString(), nullptr);
+    QNetworkRequest request = makeRequest("/actions/clipboard", m_HaveRemoteSeq ? QString("since=%1").arg(m_RemoteSeq) : QString());
+    request.setTransferTimeout(10000);
+    m_PollReply = m_Nam->get(request);
+
     QNetworkReply* reply = m_PollReply;
     connect(reply, &QNetworkReply::finished, this, [this, reply]() {
         m_PollReply = nullptr;
@@ -171,9 +228,9 @@ void ClipboardSyncWorker::poll()
 
 void ClipboardSyncWorker::handlePollReply(QNetworkReply* reply)
 {
-    int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    int status = httpStatus(reply);
     if (status != 200 && status != 204) {
-        disable(reply);
+        isFatal(reply);
         return;
     }
 
@@ -198,6 +255,9 @@ void ClipboardSyncWorker::handlePollReply(QNetworkReply* reply)
     else if (contentType.startsWith(PNG_MIME)) {
         item.mimeType = PNG_MIME;
     }
+    else if (contentType.startsWith(FILES_MIME)) {
+        item.mimeType = FILES_MIME;
+    }
     else {
         return;
     }
@@ -208,7 +268,11 @@ void ClipboardSyncWorker::handlePollReply(QNetworkReply* reply)
         return;
     }
 
-    if (writeLocal(item)) {
+    if (item.mimeType == FILES_MIME) {
+        m_LastHash = hash;
+        startDownload(seq, QJsonDocument::fromJson(item.data).array());
+    }
+    else if (writeLocal(item)) {
         m_LastHash = hash;
     }
 }
@@ -225,8 +289,15 @@ void ClipboardSyncWorker::upload(const ClipboardItem& item)
         return;
     }
 
-    m_LastHash = hashItem(item);
-    m_UploadReply = sendRequest(QString(), &item);
+    QNetworkRequest request = makeRequest("/actions/clipboard", QString());
+    request.setHeader(QNetworkRequest::ContentTypeHeader, item.mimeType);
+    request.setTransferTimeout(60000);
+
+    if (item.mimeType != FILES_MIME) {
+        m_LastHash = hashItem(item);
+    }
+    m_UploadReply = m_Nam->post(request, item.data);
+
     QNetworkReply* reply = m_UploadReply;
     connect(reply, &QNetworkReply::finished, this, [this, reply]() {
         m_UploadReply = nullptr;
@@ -243,9 +314,8 @@ void ClipboardSyncWorker::upload(const ClipboardItem& item)
 
 void ClipboardSyncWorker::handleUploadReply(QNetworkReply* reply)
 {
-    int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-    if (status != 200) {
-        disable(reply);
+    if (httpStatus(reply) != 200) {
+        isFatal(reply);
         return;
     }
 
@@ -258,9 +328,9 @@ void ClipboardSyncWorker::handleUploadReply(QNetworkReply* reply)
     }
 }
 
-void ClipboardSyncWorker::disable(QNetworkReply* reply)
+bool ClipboardSyncWorker::isFatal(QNetworkReply* reply)
 {
-    int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    int status = httpStatus(reply);
 
     switch (status) {
     case 403: // This device isn't allowed to share the clipboard
@@ -271,10 +341,187 @@ void ClipboardSyncWorker::disable(QNetworkReply* reply)
         if (m_Timer != nullptr) {
             m_Timer->stop();
         }
-        break;
+        return true;
     default:
-        // Not streaming yet (409), connection hiccups and timeouts are retried on the next poll
-        break;
+        // Not streaming yet (409), connection hiccups and timeouts are retried later
+        return false;
+    }
+}
+
+bool ClipboardSyncWorker::transferActive() const
+{
+    return m_TransferReply != nullptr || !m_UploadQueue.isEmpty() || !m_DownloadQueue.isEmpty();
+}
+
+void ClipboardSyncWorker::sendFiles(QStringList paths)
+{
+    if (m_Nam == nullptr) {
+        return;
+    }
+
+    QStringList files;
+    qint64 totalSize = 0;
+    for (const QString& path : paths) {
+        QFileInfo info(path);
+        if (info.isFile()) {
+            files.append(info.absoluteFilePath());
+            totalSize += info.size();
+        }
+    }
+    if (files.isEmpty()) {
+        return;
+    }
+    if (totalSize > MAX_TRANSFER_SIZE) {
+        qInfo() << "Not sending" << files.size() << "files to the host: too large" << totalSize;
+        return;
+    }
+
+    if (transferActive()) {
+        m_PendingUploadFiles = files;
+        return;
+    }
+
+    m_UploadQueue = files;
+    m_UploadedHostPaths.clear();
+    uploadNextFile();
+}
+
+void ClipboardSyncWorker::uploadNextFile()
+{
+    if (m_UploadQueue.isEmpty()) {
+        // Every file is on the host now, so put them on its clipboard
+        ClipboardItem item;
+        item.mimeType = FILES_MIME;
+        item.data = QJsonDocument(QJsonArray::fromStringList(m_UploadedHostPaths)).toJson(QJsonDocument::Compact);
+        upload(item);
+        finishTransfer();
+        return;
+    }
+
+    QString path = m_UploadQueue.takeFirst();
+    auto file = new QFile(path);
+    if (!file->open(QIODevice::ReadOnly)) {
+        qWarning() << "Unable to read" << path << "for the host";
+        delete file;
+        m_UploadQueue.clear();
+        finishTransfer();
+        return;
+    }
+
+    QUrlQuery query;
+    query.addQueryItem("name", QFileInfo(path).fileName());
+    QNetworkRequest request = makeRequest("/actions/files", query.toString(QUrl::FullyEncoded));
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/octet-stream");
+    m_TransferReply = m_Nam->post(request, file);
+    file->setParent(m_TransferReply);
+
+    QNetworkReply* reply = m_TransferReply;
+    connect(reply, &QNetworkReply::finished, this, [this, reply, path]() {
+        m_TransferReply = nullptr;
+        reply->deleteLater();
+
+        if (httpStatus(reply) == 200) {
+            m_UploadedHostPaths.append(QString::fromUtf8(reply->readAll()));
+            uploadNextFile();
+        }
+        else {
+            qWarning() << "Sending" << path << "to the host failed:" << httpStatus(reply) << reply->errorString();
+            isFatal(reply);
+            m_UploadQueue.clear();
+            finishTransfer();
+        }
+    });
+}
+
+void ClipboardSyncWorker::startDownload(qint64 seq, const QJsonArray& files)
+{
+    qint64 totalSize = 0;
+    for (const QJsonValue& file : files) {
+        totalSize += file.toObject().value("size").toVariant().toLongLong();
+    }
+    if (files.isEmpty() || totalSize > MAX_TRANSFER_SIZE) {
+        return;
+    }
+
+    if (transferActive()) {
+        m_PendingDownload = files;
+        m_PendingDownloadSeq = seq;
+        return;
+    }
+
+    m_DownloadSeq = seq;
+    m_DownloadQueue = files;
+    m_DownloadedPaths.clear();
+    downloadNextFile();
+}
+
+void ClipboardSyncWorker::downloadNextFile()
+{
+    if (m_DownloadQueue.isEmpty()) {
+        if (writeLocalFiles(m_DownloadedPaths)) {
+            qInfo() << "Copied" << m_DownloadedPaths.size() << "files from the host";
+        }
+        finishTransfer();
+        return;
+    }
+
+    QJsonObject entry = m_DownloadQueue.takeAt(0).toObject();
+    QString path = downloadPath(entry.value("name").toString());
+    auto file = new QFile(path);
+    if (!file->open(QIODevice::WriteOnly)) {
+        qWarning() << "Unable to save" << path;
+        delete file;
+        m_DownloadQueue = QJsonArray();
+        finishTransfer();
+        return;
+    }
+
+    QNetworkRequest request = makeRequest("/actions/clipboard/file",
+                                          QString("seq=%1&index=%2").arg(m_DownloadSeq).arg(entry.value("index").toInt()));
+    m_TransferReply = m_Nam->get(request);
+    file->setParent(m_TransferReply);
+
+    QNetworkReply* reply = m_TransferReply;
+    connect(reply, &QNetworkReply::readyRead, this, [reply, file]() {
+        if (httpStatus(reply) == 200) {
+            file->write(reply->readAll());
+        }
+    });
+    connect(reply, &QNetworkReply::finished, this, [this, reply, file, path]() {
+        m_TransferReply = nullptr;
+        reply->deleteLater();
+
+        if (httpStatus(reply) == 200 && reply->error() == QNetworkReply::NoError) {
+            file->write(reply->readAll());
+            file->close();
+            m_DownloadedPaths.append(path);
+            downloadNextFile();
+        }
+        else {
+            // A 409 means the host clipboard changed mid-transfer; the next poll offers the new contents
+            file->remove();
+            isFatal(reply);
+            m_DownloadQueue = QJsonArray();
+            finishTransfer();
+        }
+    });
+}
+
+void ClipboardSyncWorker::finishTransfer()
+{
+    if (transferActive()) {
+        return;
+    }
+
+    if (!m_PendingUploadFiles.isEmpty()) {
+        QStringList files = m_PendingUploadFiles;
+        m_PendingUploadFiles.clear();
+        sendFiles(files);
+    }
+    else if (!m_PendingDownload.isEmpty()) {
+        QJsonArray files = m_PendingDownload;
+        m_PendingDownload = QJsonArray();
+        startDownload(m_PendingDownloadSeq, files);
     }
 }
 
@@ -283,6 +530,12 @@ void ClipboardSyncWorker::disable(QNetworkReply* reply)
 static UINT pngClipboardFormat()
 {
     static UINT format = RegisterClipboardFormatW(L"PNG");
+    return format;
+}
+
+static UINT dropEffectClipboardFormat()
+{
+    static UINT format = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
     return format;
 }
 
@@ -354,6 +607,33 @@ static bool setGlobalBytes(UINT format, const void* data, size_t size)
     return true;
 }
 
+static QStringList droppedFiles(HANDLE handle)
+{
+    QStringList paths;
+    QByteArray bytes = globalBytes(handle);
+    if (bytes.size() < static_cast<qsizetype>(sizeof(DROPFILES))) {
+        return paths;
+    }
+
+    auto drop = reinterpret_cast<const DROPFILES*>(bytes.constData());
+    if (!drop->fWide || drop->pFiles >= static_cast<DWORD>(bytes.size())) {
+        return paths;
+    }
+
+    // A double-NUL-terminated list of wide paths follows the header
+    auto name = reinterpret_cast<const wchar_t*>(bytes.constData() + drop->pFiles);
+    auto end = reinterpret_cast<const wchar_t*>(bytes.constData() + bytes.size());
+    while (name < end && *name != L'\0') {
+        const wchar_t* terminator = name;
+        while (terminator < end && *terminator != L'\0') {
+            terminator++;
+        }
+        paths.append(QString::fromWCharArray(name, static_cast<qsizetype>(terminator - name)));
+        name = terminator + 1;
+    }
+    return paths;
+}
+
 static QByteArray dibToPng(const QByteArray& dib)
 {
     if (dib.size() < static_cast<qsizetype>(sizeof(BITMAPINFOHEADER))) {
@@ -393,6 +673,14 @@ ClipboardItem ClipboardSyncWorker::readLocal()
     ClipboardItem item;
     ClipboardLock lock(static_cast<HWND>(m_Window));
     if (!lock.isOpen()) {
+        return item;
+    }
+
+    // Explorer also puts the file names on the clipboard as text, so files come first
+    QStringList files = droppedFiles(GetClipboardData(CF_HDROP));
+    if (!files.isEmpty()) {
+        item.mimeType = FILES_MIME;
+        item.data = QJsonDocument(QJsonArray::fromStringList(files)).toJson(QJsonDocument::Compact);
         return item;
     }
 
@@ -466,6 +754,43 @@ bool ClipboardSyncWorker::writeLocal(const ClipboardItem& item)
     return written;
 }
 
+bool ClipboardSyncWorker::writeLocalFiles(const QStringList& paths)
+{
+    if (paths.isEmpty()) {
+        return false;
+    }
+
+    std::wstring list;
+    for (const QString& path : paths) {
+        list += QDir::toNativeSeparators(path).toStdWString();
+        list.push_back(L'\0');
+    }
+    list.push_back(L'\0');
+
+    QByteArray drop(sizeof(DROPFILES), '\0');
+    auto header = reinterpret_cast<DROPFILES*>(drop.data());
+    header->pFiles = sizeof(DROPFILES);
+    header->fWide = TRUE;
+    drop.append(reinterpret_cast<const char*>(list.data()), static_cast<qsizetype>(list.size() * sizeof(wchar_t)));
+
+    bool written = false;
+    {
+        ClipboardLock lock(static_cast<HWND>(m_Window));
+        if (!lock.isOpen() || !EmptyClipboard()) {
+            return false;
+        }
+
+        written = setGlobalBytes(CF_HDROP, drop.constData(), static_cast<size_t>(drop.size()));
+
+        // Pasting in Explorer should copy the downloads, not move them
+        DWORD effect = DROPEFFECT_COPY;
+        setGlobalBytes(dropEffectClipboardFormat(), &effect, sizeof(effect));
+    }
+
+    m_LocalSeq = GetClipboardSequenceNumber();
+    return written;
+}
+
 #else
 
 ClipboardItem ClipboardSyncWorker::readLocal()
@@ -474,6 +799,11 @@ ClipboardItem ClipboardSyncWorker::readLocal()
 }
 
 bool ClipboardSyncWorker::writeLocal(const ClipboardItem&)
+{
+    return false;
+}
+
+bool ClipboardSyncWorker::writeLocalFiles(const QStringList&)
 {
     return false;
 }
