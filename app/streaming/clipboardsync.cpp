@@ -458,7 +458,8 @@ void ClipboardSyncWorker::startDownload(qint64 seq, const QJsonArray& files)
 void ClipboardSyncWorker::downloadNextFile()
 {
     if (m_DownloadQueue.isEmpty()) {
-        if (writeLocalFiles(m_DownloadedPaths)) {
+        // Leave the clipboard alone if something newer was copied on the host meanwhile
+        if (m_RemoteSeq == m_DownloadSeq && writeLocalFiles(m_DownloadedPaths)) {
             qInfo() << "Copied" << m_DownloadedPaths.size() << "files from the host";
         }
         finishTransfer();
