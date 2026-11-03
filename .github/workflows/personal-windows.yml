@@ -1,14 +1,11 @@
 ---
-# Builds the personal Windows fork on every push to `personal` and publishes a GitHub
-# release, plus the update manifest Moonlight checks, when run manually with `release` checked.
+# Builds the personal Windows fork only when run manually, and publishes a GitHub release, plus
+# the update manifest Moonlight checks, when `release` is checked.
 name: Personal Windows
 permissions:
   contents: read
 
 on:
-  push:
-    branches:
-      - personal
   workflow_dispatch:
     inputs:
       release:
