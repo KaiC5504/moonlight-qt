@@ -5,6 +5,8 @@
 
 #include "SDL_compat.h"
 
+#include <QImage>
+
 struct GamepadState {
     SDL_GameController* controller;
     SDL_JoystickID jsId;
@@ -148,6 +150,14 @@ public:
 
     bool isMouseInVideoRegion(int mouseX, int mouseY, int windowWidth = -1, int windowHeight = -1);
 
+    bool isAbsoluteMouseMode();
+
+    // Draws the host's pointer here, at stream scale, instead of the host drawing it in the video
+    void setHostCursor(const QImage& image, int hotX, int hotY, bool visible);
+
+    // Goes back to the host drawing its pointer
+    void clearHostCursor();
+
     void updateKeyboardGrabState();
 
     void updatePointerRegionLock();
@@ -226,6 +236,7 @@ private:
     QStringList m_IgnoreDeviceGuids;
     StreamingPreferences::CaptureSysKeysMode m_CaptureSystemKeysMode;
     int m_MouseCursorCapturedVisibilityState;
+    SDL_Cursor* m_HostCursor;
 
     struct {
         KeyCombo keyCombo;

@@ -12,6 +12,7 @@
 #include "video/overlaymanager.h"
 
 class ClipboardSync;
+class CursorSync;
 
 class SupportedVideoFormatList : public QList<int>
 {
@@ -263,6 +264,8 @@ private:
     bool m_UnexpectedTermination;
     SdlInputHandler* m_InputHandler;
     ClipboardSync* m_ClipboardSync;
+    CursorSync* m_CursorSync;
+    bool m_CursorSyncLocal;
     int m_MouseEmulationRefCount;
     int m_FlushingWindowEventsRef;
     QStringList m_LaunchWarnings;

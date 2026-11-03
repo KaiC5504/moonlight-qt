@@ -334,3 +334,80 @@ void SdlInputHandler::updatePointerRegionLock()
 #endif
     }
 }
+
+bool SdlInputHandler::isAbsoluteMouseMode()
+{
+    return m_AbsoluteMouseMode;
+}
+
+void SdlInputHandler::setHostCursor(const QImage& image, int hotX, int hotY, bool visible)
+{
+    if (!m_AbsoluteMouseMode) {
+        return;
+    }
+
+    if (!image.isNull()) {
+        int windowWidth, windowHeight;
+#if SDL_VERSION_ATLEAST(2, 26, 0)
+        SDL_GetWindowSizeInPixels(m_Window, &windowWidth, &windowHeight);
+#else
+        SDL_GetWindowSize(m_Window, &windowWidth, &windowHeight);
+#endif
+
+        SDL_Rect src, dst;
+        src.x = src.y = 0;
+        src.w = m_StreamWidth;
+        src.h = m_StreamHeight;
+        dst.x = dst.y = 0;
+        dst.w = windowWidth;
+        dst.h = windowHeight;
+        StreamUtils::scaleSourceToDestinationSurface(&src, &dst);
+
+        // The host sends the pointer at stream scale, but the video may be shown larger or smaller
+        QImage cursor = image.convertToFormat(QImage::Format_ARGB32);
+        double scale = (double)dst.w / m_StreamWidth;
+        if (qAbs(scale - 1.0) > 0.01) {
+            cursor = cursor.scaled(qMax(1, qRound(cursor.width() * scale)),
+                                   qMax(1, qRound(cursor.height() * scale)),
+                                   Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+            hotX = qRound(hotX * scale);
+            hotY = qRound(hotY * scale);
+        }
+
+        SDL_Surface* surface = SDL_CreateRGBSurfaceWithFormatFrom(cursor.bits(), cursor.width(), cursor.height(), 32,
+                                                                  cursor.bytesPerLine(), SDL_PIXELFORMAT_ARGB8888);
+        if (surface != nullptr) {
+            SDL_Cursor* hostCursor = SDL_CreateColorCursor(surface,
+                                                           qBound(0, hotX, cursor.width() - 1),
+                                                           qBound(0, hotY, cursor.height() - 1));
+            SDL_FreeSurface(surface);
+            if (hostCursor != nullptr) {
+                SDL_SetCursor(hostCursor);
+                if (m_HostCursor != nullptr) {
+                    SDL_FreeCursor(m_HostCursor);
+                }
+                m_HostCursor = hostCursor;
+            }
+        }
+    }
+
+    // Over the video the pointer now shows and hides with the host's
+    m_MouseCursorCapturedVisibilityState = visible ? SDL_ENABLE : SDL_DISABLE;
+    if (isCaptureActive()) {
+        int mouseX, mouseY;
+        SDL_GetMouseState(&mouseX, &mouseY);
+        SDL_ShowCursor((isMouseInVideoRegion(mouseX, mouseY) && !visible) ? SDL_DISABLE : SDL_ENABLE);
+    }
+}
+
+void SdlInputHandler::clearHostCursor()
+{
+    if (m_HostCursor == nullptr) {
+        return;
+    }
+
+    SDL_SetCursor(SDL_GetDefaultCursor());
+    SDL_FreeCursor(m_HostCursor);
+    m_HostCursor = nullptr;
+    m_MouseCursorCapturedVisibilityState = SDL_DISABLE;
+}

@@ -3,6 +3,7 @@
 #include "streaming/streamutils.h"
 #include "backend/richpresencemanager.h"
 #include "streaming/clipboardsync.h"
+#include "streaming/cursorsync.h"
 
 #include <Limelight.h>
 #include "SDL_compat.h"
@@ -578,6 +579,8 @@ Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *prefere
       m_UnexpectedTermination(true), // Failure prior to streaming is unexpected
       m_InputHandler(nullptr),
       m_ClipboardSync(nullptr),
+      m_CursorSync(nullptr),
+      m_CursorSyncLocal(false),
       m_MouseEmulationRefCount(0),
       m_FlushingWindowEventsRef(0),
       m_ShouldExit(false),
@@ -1972,6 +1975,10 @@ void Session::exec()
     {
         NvHTTP http(m_Computer);
         m_ClipboardSync = new ClipboardSync(http.m_BaseUrlHttps, http.serverCert());
+
+        // In remote desktop mouse mode this PC draws the host's pointer, so it moves without waiting for the video
+        m_CursorSyncLocal = m_InputHandler->isAbsoluteMouseMode();
+        m_CursorSync = new CursorSync(http.m_BaseUrlHttps, http.serverCert(), m_StreamConfig.width, m_CursorSyncLocal);
     }
 
     // Files dropped onto the stream window are copied to the host
@@ -2072,6 +2079,12 @@ void Session::exec()
                 m_InputHandler->setAdaptiveTriggers((uint16_t)(uintptr_t)event.user.data1,
                                                     (DualSenseOutputReport *)event.user.data2);
                 break;
+            case SDL_CODE_HOST_CURSOR: {
+                auto update = (CursorUpdate*)event.user.data1;
+                m_InputHandler->setHostCursor(update->image, update->hotX, update->hotY, update->visible);
+                delete update;
+                break;
+            }
             default:
                 SDL_assert(false);
             }
@@ -2285,6 +2298,12 @@ void Session::exec()
         case SDL_KEYDOWN:
             presence.runCallbacks();
             m_InputHandler->handleKeyEvent(&event.key);
+
+            // The mouse mode combo hands the pointer back to the host, or takes it again
+            if (m_CursorSync != nullptr && m_InputHandler->isAbsoluteMouseMode() != m_CursorSyncLocal) {
+                m_CursorSyncLocal = m_InputHandler->isAbsoluteMouseMode();
+                m_CursorSync->setLocal(m_CursorSyncLocal);
+            }
             break;
         case SDL_MOUSEBUTTONDOWN:
         case SDL_MOUSEBUTTONUP:
@@ -2346,6 +2365,8 @@ void Session::exec()
 DispatchDeferredCleanup:
     delete m_ClipboardSync;
     m_ClipboardSync = nullptr;
+    delete m_CursorSync;
+    m_CursorSync = nullptr;
 
     // Switch back to synchronous logging mode
     StreamUtils::exitAsyncLoggingMode();
